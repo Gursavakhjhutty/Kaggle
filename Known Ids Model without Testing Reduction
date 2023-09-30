@@ -1,0 +1,110 @@
+# Known Ids Model
+# Kaggle Single Cell Perturbation Competition
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
+from rdkit import Chem
+from rdkit.Chem import RDKFingerprint, rdMolDescriptors
+import numpy as np
+import requests
+from urllib.request import urlopen
+from urllib.parse import quote
+import pubchempy as pcp
+import time
+
+
+# Set file Paths from Kaggle Single Cell Perturbation Competition
+base_path = "C:\\Users\\gursa\\Kaggle Competitions\\Single Cell Perturbations\\open-problems-single-cell-perturbations"
+id_map_path = base_path + "\\id_map.csv"
+multiome_obs_meta_path = base_path + "\\multiome_obs_meta.csv"
+de_train_path = base_path + "\\de_train.parquet"
+# Load Csv Files into DataFrames
+id_map = pd.read_csv(id_map_path)
+multiome_obs_meta = pd.read_csv(multiome_obs_meta_path)
+# Load the primary differential expression data
+de_train = pd.read_parquet(de_train_path)
+# Remove duplicate rows based on 'cell_type' in id_map
+# Here we simply keep the first occurrence and discard the duplicates
+id_map_unique = id_map.drop_duplicates(subset='cell_type', keep='first')
+merged_data = pd.merge(multiome_obs_meta, id_map_unique, on='cell_type', how='left')
+
+cell_type_encoded = pd.get_dummies(merged_data['cell_type'], prefix='cell_type')
+merged_data = pd.concat([merged_data, cell_type_encoded], axis=1)
+merged_data = merged_data.drop(columns=['cell_type'])
+
+merged_data['id'] = merged_data['id'].fillna("Unknown")
+
+def get_smiles_from_name(name):
+    retries = 5
+    delay = 1  # start with 1 second delay
+    for i in range(retries):
+        try:
+            compounds = pcp.get_compounds(name, 'name')
+            if compounds:
+                return compounds[0].isomeric_smiles
+            else:
+                return None
+        except pcp.PubChemHTTPError as e:
+            if i < retries - 1:  # i is 0 indexed
+                print(f"Error occurred: {e}. Retrying in {delay} seconds.")
+                time.sleep(delay)
+                delay *= 2  # double the delay
+            else:
+                print(f"Failed to get data after {retries} retries.")
+                return None
+
+known_data = merged_data[merged_data['id'] != 'Unknown']
+# Convert name to SMILES
+known_data.loc[:, 'sm_name'] = known_data['sm_name'].apply(lambda x: get_smiles_from_name(x) if type(x) == str else x)
+
+# Filter out rows where SMILES conversion did not work
+known_data = known_data[~known_data['sm_name'].isnull()]
+train_known, val_known = train_test_split(known_data, test_size=0.2)
+
+def smiles_to_fingerprint(smiles_str, fingerprint_type="morgan"):
+    if not isinstance(smiles_str, str):
+        return None
+    mol = Chem.MolFromSmiles(smiles_str)
+    if mol is None:
+        return None
+    if fingerprint_type == "rdk":
+        fingerprint = RDKFingerprint(mol)
+    elif fingerprint_type == "morgan":
+        fingerprint = rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, radius=2)
+    else:
+        raise ValueError(f"Unsupported fingerprint type: {fingerprint_type}")
+    return np.array(fingerprint)
+
+# Convert SMILES to fingerprints
+known_data['rdk_fingerprint'] = known_data['sm_name'].apply(lambda x: smiles_to_fingerprint(x, fingerprint_type="rdk"))
+known_data['morgan_fingerprint'] = known_data['sm_name'].apply(lambda x: smiles_to_fingerprint(x, fingerprint_type="morgan"))
+
+# Drop the 'sm_name' column
+known_data.drop(columns=['sm_name'], inplace=True)
+
+# Prepare features and target for model training
+gene_features = [col for col in known_data.columns if col.startswith("gene_")]
+
+# You'll want to exclude non-numeric columns, especially the fingerprints columns for now.
+# This is a simplistic approach; in a more detailed pipeline, you might want to convert these fingerprints to a format the model can use.
+features_to_exclude = gene_features + ['rdk_fingerprint', 'morgan_fingerprint']
+X_train_known = train_known.drop(columns=features_to_exclude)
+y_train_known = train_known[gene_features]
+X_val_known = val_known.drop(columns=features_to_exclude)
+y_val_known = val_known[gene_features]
+
+# Train and evaluate the model
+rf_known = RandomForestRegressor(n_estimators=100, random_state=42)
+rf_known.fit(X_train_known, y_train_known)
+
+y_val_pred = rf_known.predict(X_val_known)
+
+mse = mean_squared_error(y_val_known, y_val_pred)
+print(f"Mean Squared Error on Validation Set: {mse}")
+
+
+
